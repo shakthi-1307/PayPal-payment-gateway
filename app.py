@@ -1,30 +1,31 @@
-import os 
+import os
 import sqlite3
-from flask import Flask,g,redirect,render_template,request,session,url_for,jsonify
-from dotenv import load_dotenv
+
+from flask import Flask, g, redirect, render_template, request, session, url_for, jsonify
 from werkzeug.security import check_password_hash, generate_password_hash
+from dotenv import load_dotenv
+
 from paypalserversdk.paypal_serversdk_client import PaypalServersdkClient
+from paypalserversdk.configuration import Environment
 from paypalserversdk.http.auth.o_auth_2 import ClientCredentialsAuthCredentials
-from paypalserversdk.configuration import Environment 
 from paypalserversdk.models.order_request import OrderRequest
-from paypalserversdk.models.purchase_unit_request import PurchaseUnitRequest 
+from paypalserversdk.models.purchase_unit_request import PurchaseUnitRequest
 from paypalserversdk.models.amount_with_breakdown import AmountWithBreakdown
-from paypalserversdk.models.order_request import OrderRequest 
 from paypalserversdk.models.checkout_payment_intent import CheckoutPaymentIntent
 
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY")
+app.secret_key = os.environ["FLASK_SECRET"]
 
-app.config("PAYPAL_CLIENT_ID") = os.getenv("PAYPAL_CLIENT_ID")
+app.config["PAYPAL_CLIENT_ID"] = os.environ["PAYPAL_CLIENT_ID"]
 
 paypal = PaypalServersdkClient(
-    client_credentials_auth_credentials = ClientCredentialsAuthCredentials(
-        o_auth_client_id = os.getenv("PAYPAL_CLIENT_ID"),
-        o_auth_client_secret = os.getenv("PAYPAL_CLIENT_SECRET")
+    client_credentials_auth_credentials=ClientCredentialsAuthCredentials(
+        o_auth_client_id=os.environ["PAYPAL_CLIENT_ID"],
+        o_auth_client_secret=os.environ["PAYPAL_CLIENT_SECRET"],
     ),
-    environment = Environment.SANDBOX
+    environment=Environment.SANDBOX,
 )
 
 PRODUCTS = {
@@ -142,57 +143,69 @@ def cart_total(cart):
     total = sum(float(PRODUCTS[int(pid)]["price"]) * qty for pid, qty in cart.items())
     return f"{total:.2f}"
 
-@app.route("/api/orders",methods = ['POST'])
+
+@app.route("/api/orders", methods=["POST"])
 def create_order():
     if current_user() is None:
-        return jsonify({"error":"Login Required"}),401
-    
-    cart = session.get("cart",{})
-    
+        return jsonify({"error": "login required"}), 401
+
+    cart = session.get("cart", {})
     if not cart:
-        return jsonify({"error":"Cart is empty"}),400
-    
+        return jsonify({"error": "cart is empty"}), 400
+
     order = paypal.orders.create_order({
-        "body":OrderRequest(
-            intent = CheckoutPaymentIntent.CAPTURE,
-            purchase_units = [
+        "body": OrderRequest(
+            intent=CheckoutPaymentIntent.CAPTURE,
+            purchase_units=[
                 PurchaseUnitRequest(
-                    amount = AmountWithBreakdown(
-                        currency_code = "USD",
-                        value = cart_total(cart)
+                    amount=AmountWithBreakdown(
+                        currency_code="USD",
+                        value=cart_total(cart),
                     )
                 )
-            ]
+            ],
         )
     })
-    
-    return jsonify({"id":order.body.id})
+    order_id = order.body.id
+    session[f"order_{order_id}"] = {"cart": cart, "total": cart_total(cart)}
+    return jsonify({"id": order_id})
 
-@app.route("/api/orders/<order_id>/capture",methods = ['POST'])
+
+@app.route("/api/orders/<order_id>/capture", methods=["POST"])
 def capture_order(order_id):
     user = current_user()
-    
     if user is None:
-        return jsonify({"error":"Login required"}),401
-    
-    result = paypal.order.capture_order({"id":order_id,"prefer":"return = representation"})
+        return jsonify({"error": "login required"}), 401
+
+    pending = session.get(f"order_{order_id}")
+    if pending is None:
+        return jsonify({"error": "unknown order"}), 400
+
+    result = paypal.orders.capture_order({"id": order_id, "prefer": "return=representation"})
     captured = result.body
-    
+
     if captured.status == "COMPLETED":
-        cart = session.get('cart',{})
-        items = ', '.join(f"{PRODUCTS[int(pid)]['name']} x{qty}" for pid,qty in cart.items())
-        
+        paid = captured.purchase_units[0].payments.captures[0].amount.value
+        if float(paid) != float(pending["total"]):
+            return jsonify({"error": "amount mismatch"}), 400
+
+        cart = pending["cart"]
+        items = ", ".join(
+            f"{PRODUCTS[int(pid)]['name']} x{qty}" for pid, qty in cart.items()
+        )
         db = get_db()
         db.execute(
-            "INSERT INTO orders (urser_id, paypal_order_id, amount, status, items) VALUES (?,?,?,?,?)",
-            (user['id'],captured.id,cart_total(cart),"PAID",items)
+            "INSERT INTO orders (user_id, paypal_order_id, amount, status, items)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (user["id"], captured.id, paid, "PAID", items),
         )
-        
         db.commit()
-        session.pop('cart',None)
-        
-        return jsonify({'status':captured.status})
-    
+        session.pop("cart", None)
+        session.pop(f"order_{order_id}", None)
+
+    return jsonify({"status": captured.status})
+
+
 @app.route("/orders")
 def my_orders():
     user = current_user()
@@ -219,4 +232,3 @@ def admin():
 if __name__ == "__main__":
     init_db()
     app.run(debug=True, port=5000)
-
